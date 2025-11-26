@@ -1,3 +1,5 @@
+list(APPEND api_headers PRIVATE ${RENDERDOC_HEADERS_PATH})
+
 if (OFFLOADTEST_ENABLE_VULKAN)
   list(APPEND api_sources VK/Device.cpp)
   list(APPEND api_libraries ${Vulkan_LIBRARIES})

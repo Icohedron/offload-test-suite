@@ -13,6 +13,15 @@
 #include "Support/Pipeline.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/Error.h"
+#include "renderdoc_app.h"
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+#ifdef __linux__
+#include <dlfcn.h>
+#endif
 
 #include <memory>
 #include <numeric>
@@ -1933,9 +1942,33 @@ public:
   }
 
   llvm::Error executeProgram(Pipeline &P) override {
+    // Initialize RenderDoc on Windows
+    RENDERDOC_API_1_1_2 *RDocAPI = NULL;
+#if defined(_WIN32)
+    if(HMODULE Mod = GetModuleHandleA("renderdoc.dll")) {
+        pRENDERDOC_GetAPI RENDERDOC_GetAPI =
+            (pRENDERDOC_GetAPI)GetProcAddress(Mod, "RENDERDOC_GetAPI");
+        int Ret = RENDERDOC_GetAPI(eRENDERDOC_API_Version_1_1_2, (void **)&RDocAPI);
+        assert(Ret == 1);
+        llvm::outs() << "RenderDoc API initialized.\n";
+    }
+#elif defined(__linux__)
+    if(void *Mod = dlopen("librenderdoc.so", RTLD_NOW | RTLD_NOLOAD)) {
+        pRENDERDOC_GetAPI RENDERDOC_GetAPI = (pRENDERDOC_GetAPI)dlsym(Mod, "RENDERDOC_GetAPI");
+        int Ret = RENDERDOC_GetAPI(eRENDERDOC_API_Version_1_1_2, (void **)&RDocAPI);
+        assert(Ret == 1);
+        llvm::outs() << "RenderDoc API initialized.\n";
+    }
+#endif
     InvocationState State;
     if (auto Err = createDevice(State))
       return Err;
+
+    if (RDocAPI) {
+      RDocAPI->StartFrameCapture(NULL, NULL);
+      llvm::outs() << "RenderDoc Frame Capture started.\n";
+    }
+
     llvm::outs() << "Physical device created.\n";
     if (auto Err = createShaderModules(P, State))
       return Err;
@@ -1978,6 +2011,19 @@ public:
     if (auto Err = readBackData(P, State))
       return Err;
     llvm::outs() << "Compute pipeline created.\n";
+
+    if (RDocAPI) {
+      uint32_t Ret = RDocAPI->EndFrameCapture(NULL, NULL);
+      if (Ret) {
+        llvm::outs() << "RenderDoc Frame Capture ended.\n";
+        uint32_t CaptureID = RDocAPI->GetNumCaptures() - 1;
+        uint32_t PathLength;
+        RDocAPI->GetCapture(CaptureID, NULL, &PathLength, NULL);
+        std::string CapturePath(PathLength, ' ');
+        RDocAPI->GetCapture(CaptureID, CapturePath.data(), NULL, NULL);
+        llvm::outs() << "The RenderDoc Frame Capture has been saved to " << CapturePath << "\n";
+      } else llvm::outs() << "RenderDoc Frame Capture failed.\n";
+    }
 
     if (auto Err = cleanup(State))
       return Err;
