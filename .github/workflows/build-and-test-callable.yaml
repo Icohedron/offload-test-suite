@@ -146,6 +146,16 @@ jobs:
         uses: llvm/actions/setup-windows@89a8cf80982d830faab019237860b344a6390c30 # main
         with:
           arch: arm64
+      - name: Generate DxDiag
+        if: inputs.OS == 'windows'
+        shell: cmd
+        run: dxdiag /t ${{ github.workspace }}/dxdiag.txt
+      - name: Upload DxDiag
+        if: inputs.OS == 'windows'
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # main
+        with:
+          name: dxdiag-${{ inputs.SKU }}
+          path: ${{ github.workspace }}/dxdiag.txt
       - name: Detect Clang
         id: Test-Clang
         shell: bash
