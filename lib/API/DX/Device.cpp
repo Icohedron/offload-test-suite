@@ -19,11 +19,34 @@
 #include <dxguids.h>
 
 #ifndef _WIN32
+#ifndef STDMETHODCALLTYPE
+#define STDMETHODCALLTYPE
+#endif
+// Helper to work around a C++ ABI mismatch on Linux when using vkd3d or
+// vkd3d-proton. Microsoft's native headers define these methods as returning
+// small structs by value, which the Itanium C++ ABI (Linux) returns directly in
+// registers (e.g., RAX). However, vkd3d libraries are built using Wine's widl,
+// which enforces the MSVC ABI on all platforms by transforming struct returns
+// into hidden pointer output parameters. This proxy interface explicitly models
+// the widl-generated signature so the compiler handles the hidden pointer
+// automatically, avoiding segfaults.
+struct ID3D12DescriptorHeap_VKD3D : public ID3D12Pageable {
+  virtual D3D12_DESCRIPTOR_HEAP_DESC STDMETHODCALLTYPE GetDesc() = 0;
+  virtual void STDMETHODCALLTYPE
+  GetCPUDescriptorHandleForHeapStart(D3D12_CPU_DESCRIPTOR_HANDLE *RetVal) = 0;
+  virtual void STDMETHODCALLTYPE
+  GetGPUDescriptorHandleForHeapStart(D3D12_GPU_DESCRIPTOR_HANDLE *RetVal) = 0;
+};
+#endif
+
+#ifndef _WIN32
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
+#ifndef __WSL__
+#include <vulkan/vulkan.h>
+#endif
 #include <wsl/winadapter.h>
-
 #endif
 
 // The windows headers define these macros which conflict with the C++ standard
@@ -368,10 +391,17 @@ public:
            std::string Desc)
       : Adapter(A), Device(D), GraphicsQueue(Q) {
     Description = Desc;
+#ifndef _WIN32
+    IsVKD3D = Description.find("vkd3d") != std::string::npos;
+#endif
   }
   DXDevice(const DXDevice &) = default;
 
   ~DXDevice() override = default;
+
+#ifndef _WIN32
+  bool IsVKD3D = false;
+#endif
 
   llvm::StringRef getAPIName() const override { return "DirectX"; }
   GPUAPI getAPI() const override { return GPUAPI::DirectX; }
@@ -414,21 +444,30 @@ public:
   }
 
   static llvm::Expected<std::unique_ptr<offloadtest::Device>>
-  create(ComPtr<IDXCoreAdapter> Adapter, const DeviceConfig &Config) {
+  create(ComPtr<IDXCoreAdapter> Adapter, const DeviceConfig &Config,
+         std::string OverrideDesc = "") {
     ComPtr<ID3D12Device> Device;
-    if (auto Err =
-            HR::toError(D3D12CreateDevice(Adapter.Get(), D3D_FEATURE_LEVEL_11_0,
-                                          IID_PPV_ARGS(&Device)),
-                        "Failed to create D3D device"))
+    if (auto Err = HR::toError(
+            D3D12CreateDevice(Adapter ? Adapter.Get() : nullptr,
+                              D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&Device)),
+            "Failed to create D3D device"))
       return Err;
-    assert(
-        Adapter->IsPropertySupported(DXCoreAdapterProperty::DriverDescription));
-    size_t BufferSize;
-    Adapter->GetPropertySize(DXCoreAdapterProperty::DriverDescription,
-                             &BufferSize);
-    std::vector<char> DescVec(BufferSize);
-    Adapter->GetProperty(DXCoreAdapterProperty::DriverDescription, BufferSize,
-                         (void *)DescVec.data());
+
+    std::vector<char> DescVec;
+    std::string DescStr =
+        OverrideDesc.empty() ? "Generic D3D12 Device" : OverrideDesc;
+    if (Adapter) {
+      assert(Adapter->IsPropertySupported(
+          DXCoreAdapterProperty::DriverDescription));
+      size_t BufferSize;
+      Adapter->GetPropertySize(DXCoreAdapterProperty::DriverDescription,
+                               &BufferSize);
+      DescVec.resize(BufferSize);
+      Adapter->GetProperty(DXCoreAdapterProperty::DriverDescription, BufferSize,
+                           (void *)DescVec.data());
+      DescStr = DescVec.data();
+    }
+
     if (Config.EnableDebugLayer || Config.EnableValidationLayer)
       if (auto Err = configureInfoQueue(Device.Get()))
         return Err;
@@ -439,7 +478,7 @@ public:
     const DXQueue GraphicsQueue = *GraphicsQueueOrErr;
 
     return std::make_unique<DXDevice>(Adapter, Device, std::move(GraphicsQueue),
-                                      std::string(DescVec.data()));
+                                      DescStr);
   }
 
   const Capabilities &getCapabilities() override {
@@ -579,9 +618,9 @@ public:
   llvm::Error createDescriptorHeap(Pipeline &P, InvocationState &State) {
     if (P.getDescriptorCount() == 0)
       return llvm::Error::success();
+
     const D3D12_DESCRIPTOR_HEAP_DESC HeapDesc = {
-        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-        P.getDescriptorCountWithFlattenedArrays(),
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, P.getDescriptorCount(),
         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     if (auto Err = HR::toError(Device->CreateDescriptorHeap(
                                    &HeapDesc, IID_PPV_ARGS(&State.DescHeap)),
@@ -785,8 +824,17 @@ public:
     const D3D12_SHADER_RESOURCE_VIEW_DESC SRVDesc = getSRVDescription(R);
     const uint32_t DescHandleIncSize = Device->GetDescriptorHandleIncrementSize(
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    const D3D12_CPU_DESCRIPTOR_HANDLE SRVHandleHeapStart =
-        IS.DescHeap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_CPU_DESCRIPTOR_HANDLE SRVHandleHeapStart;
+#ifndef _WIN32
+    if (this->IsVKD3D) {
+      reinterpret_cast<ID3D12DescriptorHeap_VKD3D *>(IS.DescHeap.Get())
+          ->GetCPUDescriptorHandleForHeapStart(&SRVHandleHeapStart);
+    } else {
+      SRVHandleHeapStart = IS.DescHeap->GetCPUDescriptorHandleForHeapStart();
+    }
+#else
+    SRVHandleHeapStart = IS.DescHeap->GetCPUDescriptorHandleForHeapStart();
+#endif
 
     for (const ResourceSet &RS : ResBundle) {
       llvm::outs() << "SRV: HeapIdx = " << HeapIdx << " EltSize = " << EltSize
@@ -911,8 +959,17 @@ public:
     const D3D12_UNORDERED_ACCESS_VIEW_DESC UAVDesc = getUAVDescription(R);
     const uint32_t DescHandleIncSize = Device->GetDescriptorHandleIncrementSize(
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    const D3D12_CPU_DESCRIPTOR_HANDLE UAVHandleHeapStart =
-        IS.DescHeap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_CPU_DESCRIPTOR_HANDLE UAVHandleHeapStart;
+#ifndef _WIN32
+    if (this->IsVKD3D) {
+      reinterpret_cast<ID3D12DescriptorHeap_VKD3D *>(IS.DescHeap.Get())
+          ->GetCPUDescriptorHandleForHeapStart(&UAVHandleHeapStart);
+    } else {
+      UAVHandleHeapStart = IS.DescHeap->GetCPUDescriptorHandleForHeapStart();
+    }
+#else
+    UAVHandleHeapStart = IS.DescHeap->GetCPUDescriptorHandleForHeapStart();
+#endif
 
     for (const ResourceSet &RS : ResBundle) {
       llvm::outs() << "UAV: HeapIdx = " << HeapIdx << " EltSize = " << EltSize
@@ -1003,8 +1060,17 @@ public:
     const size_t CBVSize = getCBVSize(R.size());
     const uint32_t DescHandleIncSize = Device->GetDescriptorHandleIncrementSize(
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    const D3D12_CPU_DESCRIPTOR_HANDLE CVBHandleHeapStart =
-        IS.DescHeap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_CPU_DESCRIPTOR_HANDLE CVBHandleHeapStart;
+#ifndef _WIN32
+    if (this->IsVKD3D) {
+      reinterpret_cast<ID3D12DescriptorHeap_VKD3D *>(IS.DescHeap.Get())
+          ->GetCPUDescriptorHandleForHeapStart(&CVBHandleHeapStart);
+    } else {
+      CVBHandleHeapStart = IS.DescHeap->GetCPUDescriptorHandleForHeapStart();
+    }
+#else
+    CVBHandleHeapStart = IS.DescHeap->GetCPUDescriptorHandleForHeapStart();
+#endif
 
     for (const ResourceSet &RS : ResBundle) {
       llvm::outs() << "CBV: HeapIdx = " << HeapIdx << " Size = " << CBVSize
@@ -1206,7 +1272,16 @@ public:
     if (IS.DescHeap) {
       ID3D12DescriptorHeap *const Heaps[] = {IS.DescHeap.Get()};
       IS.CmdList->SetDescriptorHeaps(1, Heaps);
+#ifndef _WIN32
+      if (this->IsVKD3D) {
+        reinterpret_cast<ID3D12DescriptorHeap_VKD3D *>(IS.DescHeap.Get())
+            ->GetGPUDescriptorHandleForHeapStart(&Handle);
+      } else {
+        Handle = IS.DescHeap->GetGPUDescriptorHandleForHeapStart();
+      }
+#else
       Handle = IS.DescHeap->GetGPUDescriptorHandleForHeapStart();
+#endif
     }
     IS.CmdList->SetComputeRootSignature(IS.RootSig.Get());
     IS.CmdList->SetPipelineState(IS.PSO.Get());
@@ -1562,16 +1637,36 @@ public:
                                    &RTVHeapDesc, IID_PPV_ARGS(&IS.RTVHeap)),
                                "Failed to create RTV heap"))
       return Err;
-    const D3D12_CPU_DESCRIPTOR_HANDLE RTVHandle =
-        IS.RTVHeap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_CPU_DESCRIPTOR_HANDLE RTVHandle;
+#ifndef _WIN32
+    if (this->IsVKD3D) {
+      reinterpret_cast<ID3D12DescriptorHeap_VKD3D *>(IS.RTVHeap.Get())
+          ->GetCPUDescriptorHandleForHeapStart(&RTVHandle);
+    } else {
+      RTVHandle = IS.RTVHeap->GetCPUDescriptorHandleForHeapStart();
+    }
+#else
+    RTVHandle = IS.RTVHeap->GetCPUDescriptorHandleForHeapStart();
+#endif
     Device->CreateRenderTargetView(IS.RT.Get(), nullptr, RTVHandle);
 
     IS.CmdList->SetGraphicsRootSignature(IS.RootSig.Get());
     if (IS.DescHeap) {
       ID3D12DescriptorHeap *const Heaps[] = {IS.DescHeap.Get()};
       IS.CmdList->SetDescriptorHeaps(1, Heaps);
+#ifndef _WIN32
+      D3D12_GPU_DESCRIPTOR_HANDLE HeapStartHandle;
+      if (this->IsVKD3D) {
+        reinterpret_cast<ID3D12DescriptorHeap_VKD3D *>(IS.DescHeap.Get())
+            ->GetGPUDescriptorHandleForHeapStart(&HeapStartHandle);
+      } else {
+        HeapStartHandle = IS.DescHeap->GetGPUDescriptorHandleForHeapStart();
+      }
+      IS.CmdList->SetGraphicsRootDescriptorTable(0, HeapStartHandle);
+#else
       IS.CmdList->SetGraphicsRootDescriptorTable(
           0, IS.DescHeap->GetGPUDescriptorHandleForHeapStart());
+#endif
     }
     IS.CmdList->SetPipelineState(IS.PSO.Get());
 
@@ -1755,6 +1850,7 @@ llvm::Error offloadtest::initializeDX12Devices(
   }
 #endif
 
+#if defined(_WIN32) || defined(__WSL__) // WIN32 or WSL uses DXCore
   ComPtr<IDXCoreAdapterFactory> Factory;
   if (auto Err = HR::toError(DXCoreCreateAdapterFactory(Factory.GetAddressOf()),
                              "Failed to create DXCore Adapter Factory")) {
@@ -1784,5 +1880,16 @@ llvm::Error offloadtest::initializeDX12Devices(
       return ExDevice.takeError();
     Devices.push_back(std::move(*ExDevice));
   }
+#else
+  // Bypass physical device enumeration for vkd3d-proton on Linux due to the
+  // complexities of integrating DXCore into a native Linux build.
+  // Passing nullptr to D3D12CreateDevice selects the default device.
+  // Users can override the default device by setting the VKD3D_VULKAN_DEVICE
+  // environment variable.
+  auto ExDevice = DXDevice::create(nullptr, Config, "Default D3D12 Device (vkd3d-proton)");
+  if (!ExDevice)
+    return ExDevice.takeError();
+  Devices.push_back(std::move(*ExDevice));
+#endif
   return llvm::Error::success();
 }
