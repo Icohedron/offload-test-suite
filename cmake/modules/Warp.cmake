@@ -1,11 +1,14 @@
 function(guess_nuget_arch output_var)
-  if ((CMAKE_GENERATOR_PLATFORM STREQUAL "x64") OR ("${CMAKE_C_COMPILER_ARCHITECTURE_ID}" STREQUAL "x64"))
+  string(TOLOWER "${CMAKE_GENERATOR_PLATFORM}" generator_platform)
+  string(TOLOWER "${CMAKE_C_COMPILER_ARCHITECTURE_ID}" compiler_arch)
+
+  if ((generator_platform STREQUAL "x64") OR (compiler_arch STREQUAL "x64"))
     set(${output_var} "x64" PARENT_SCOPE)
-  elseif ((CMAKE_GENERATOR_PLATFORM STREQUAL "x86") OR ("${CMAKE_C_COMPILER_ARCHITECTURE_ID}" STREQUAL "x86"))
+  elseif ((generator_platform STREQUAL "x86") OR (compiler_arch STREQUAL "x86"))
     set(${output_var} "x86" PARENT_SCOPE)
-  elseif ((CMAKE_GENERATOR_PLATFORM MATCHES "ARM64.*") OR ("${CMAKE_C_COMPILER_ARCHITECTURE_ID}" MATCHES "ARM64.*"))
+  elseif ((generator_platform MATCHES "arm64.*") OR (compiler_arch MATCHES "arm64.*"))
     set(${output_var} "arm64" PARENT_SCOPE)
-  elseif ((CMAKE_GENERATOR_PLATFORM MATCHES "ARM.*") OR ("${CMAKE_C_COMPILER_ARCHITECTURE_ID}" MATCHES "ARM.*"))
+  elseif ((generator_platform MATCHES "arm.*") OR (compiler_arch MATCHES "arm.*"))
     set(${output_var} "arm" PARENT_SCOPE)
   else()
     message(FATAL_ERROR "Failed to guess NuGet arch! (${CMAKE_GENERATOR_PLATFORM}, ${CMAKE_C_COMPILER_ARCHITECTURE_ID})")
@@ -46,12 +49,12 @@ function(setup_warp version)
 
   file(GLOB_RECURSE LIBS "${CMAKE_CURRENT_BINARY_DIR}/warp/build/native/*/${NUGET_ARCH}/*.dll"
        $<IF:$<CONFIG:DEBUG>,"${CMAKE_CURRENT_BINARY_DIR}/warp/build/native/*/${NUGET_ARCH}/*.pdb">)
-  
+
   if (${NUGET_ARCH} STREQUAL "x64" AND NOT LIBS)
     file(GLOB_RECURSE LIBS "${CMAKE_CURRENT_BINARY_DIR}/warp/build/native/amd64/*.dll"
          $<IF:$<CONFIG:DEBUG>,"${CMAKE_CURRENT_BINARY_DIR}/warp/build/native/amd64/*.pdb">)
   endif ()
-  
+
   if (NOT LIBS)
     message(FATAL_ERROR "Requested version of WARP does not support current architecture (or it was packaged in a way we don't handle).")
   endif()
