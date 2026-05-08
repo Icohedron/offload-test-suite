@@ -34,6 +34,14 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include
 macro(add_offloadtest_tool name)
   add_llvm_executable(${name} ${ARGN})
   set_target_properties(${name} PROPERTIES FOLDER "HLSL Test/Tools")
+  install(TARGETS ${name}
+    COMPONENT ${name}
+    RUNTIME DESTINATION "${LLVM_TOOLS_INSTALL_DIR}")
+  if (NOT LLVM_ENABLE_IDE)
+    add_llvm_install_targets(install-${name}
+      DEPENDS ${name}
+      COMPONENT ${name})
+  endif()
 endmacro()
 
 macro(add_offloadtest_library name)

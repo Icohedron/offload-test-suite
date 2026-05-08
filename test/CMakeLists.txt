@@ -191,3 +191,51 @@ endif()
 
 umbrella_lit_testsuite_end(check-hlsl)
 set_target_properties(check-hlsl PROPERTIES FOLDER "HLSL tests")
+
+# === Standalone test suite distribution ===
+#
+# Install test files and a configure script for running the offload test suite
+# outside of the LLVM build tree. After installing, use configure-test-suite.py
+# to generate lit.site.cfg.py for the desired test platform.
+#
+# Usage (after install):
+#   cd <prefix>/share/hlsl-test-suite
+#   ./configure-test-suite.py --suite clang-d3d12
+#   lit run/test/clang-d3d12
+
+set(OFFLOADTEST_INSTALL_TESTDIR "share/hlsl-test-suite" CACHE STRING
+    "Install directory for the offload test suite")
+
+# Install test source files (tests, lit configs, local configs).
+install(DIRECTORY ${OFFLOADTEST_SOURCE_DIR}/test/
+  DESTINATION ${OFFLOADTEST_INSTALL_TESTDIR}/test
+  COMPONENT offload-test-suite
+  FILES_MATCHING
+    PATTERN "*.test"
+    PATTERN "*.yaml"
+    PATTERN "*.hlsl"
+    PATTERN "*.py"
+    PATTERN "*.cfg"
+    PATTERN "*.txt"
+    PATTERN "CMakeLists.txt" EXCLUDE
+    PATTERN "*.py.in" EXCLUDE
+    PATTERN "Output" EXCLUDE
+    PATTERN "__pycache__" EXCLUDE)
+
+# Install the standalone configuration script.
+install(PROGRAMS ${OFFLOADTEST_SOURCE_DIR}/configure-test-suite.py
+  DESTINATION ${OFFLOADTEST_INSTALL_TESTDIR}
+  COMPONENT offload-test-suite)
+
+# Install golden images if available.
+if (GOLDENIMAGE_DIR AND EXISTS "${GOLDENIMAGE_DIR}")
+  install(DIRECTORY ${GOLDENIMAGE_DIR}/
+    DESTINATION ${OFFLOADTEST_INSTALL_TESTDIR}/golden-images
+    COMPONENT offload-test-suite)
+endif()
+
+# Create the offload-test-suite install target.
+add_custom_target(offload-test-suite)
+set_target_properties(offload-test-suite PROPERTIES FOLDER "HLSL tests")
+add_llvm_install_targets(install-offload-test-suite
+  COMPONENT offload-test-suite)

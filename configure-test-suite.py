@@ -1,0 +1,460 @@
+#!/usr/bin/env python3
+"""Configure the HLSL offload test suite for standalone execution.
+
+This script generates lit.site.cfg.py files for running the offload test suite
+outside of the LLVM/CMake build tree. It is intended to be used after installing
+the test suite and its tool dependencies via `ninja install-distribution`.
+
+Prerequisites on the target machine:
+  - Python 3.6+
+  - pip install lit pyyaml
+  - GPU drivers (D3D12, Vulkan, or Metal depending on suite)
+  - DXC compiler (only for non-clang test suites)
+
+Usage:
+  ./configure-test-suite.py --suite <name> [options]
+
+Examples:
+  # Configure for testing clang-compiled shaders on D3D12:
+  ./configure-test-suite.py --suite clang-d3d12
+
+  # Configure with explicit paths:
+  ./configure-test-suite.py --suite clang-d3d12 \\
+      --bin-dir /opt/hlsl/bin \\
+      --output-dir /tmp/hlsl-test-run
+
+  # Configure for DXC (non-clang) testing on Vulkan:
+  ./configure-test-suite.py --suite vk --dxc-path /usr/local/bin/dxc
+
+  # Configure multiple suites at once:
+  ./configure-test-suite.py --suite clang-d3d12 --suite clang-vk
+
+  # List all available suites:
+  ./configure-test-suite.py --list-suites
+"""
+
+import argparse
+import os
+import platform
+import shutil
+import sys
+import textwrap
+
+# Mapping of suite names to their platform/compiler configuration.
+SUITES = {
+    "d3d12": {
+        "d3d12": True,
+        "vk": False,
+        "mtl": False,
+        "clang": False,
+        "warp": False,
+        "desc": "DXC-compiled shaders on DirectX 12",
+    },
+    "vk": {
+        "d3d12": False,
+        "vk": True,
+        "mtl": False,
+        "clang": False,
+        "warp": False,
+        "desc": "DXC-compiled shaders on Vulkan",
+    },
+    "mtl": {
+        "d3d12": False,
+        "vk": False,
+        "mtl": True,
+        "clang": False,
+        "warp": False,
+        "desc": "DXC-compiled shaders on Metal",
+    },
+    "clang-d3d12": {
+        "d3d12": True,
+        "vk": False,
+        "mtl": False,
+        "clang": True,
+        "warp": False,
+        "desc": "Clang-compiled shaders on DirectX 12",
+    },
+    "clang-vk": {
+        "d3d12": False,
+        "vk": True,
+        "mtl": False,
+        "clang": True,
+        "warp": False,
+        "desc": "Clang-compiled shaders on Vulkan",
+    },
+    "clang-mtl": {
+        "d3d12": False,
+        "vk": False,
+        "mtl": True,
+        "clang": True,
+        "warp": False,
+        "desc": "Clang-compiled shaders on Metal",
+    },
+    "warp-d3d12": {
+        "d3d12": True,
+        "vk": False,
+        "mtl": False,
+        "clang": False,
+        "warp": True,
+        "desc": "DXC-compiled shaders on WARP (Windows only)",
+    },
+    "clang-warp-d3d12": {
+        "d3d12": True,
+        "vk": False,
+        "mtl": False,
+        "clang": True,
+        "warp": True,
+        "desc": "Clang-compiled shaders on WARP (Windows only)",
+    },
+}
+
+
+def get_script_dir():
+    """Return the directory containing this script."""
+    return os.path.dirname(os.path.realpath(__file__))
+
+
+def find_bin_dir(script_dir):
+    """Try to find the bin directory relative to the script location.
+
+    Expected install layout:
+      <prefix>/bin/                           (tools)
+      <prefix>/share/hlsl-test-suite/         (this script)
+    """
+    candidate = os.path.realpath(os.path.join(script_dir, "..", "..", "bin"))
+    if os.path.isdir(candidate):
+        return candidate
+    return None
+
+
+def find_golden_images(script_dir):
+    """Try to find the golden images directory in the install tree."""
+    candidate = os.path.join(script_dir, "golden-images")
+    if os.path.isdir(candidate):
+        return os.path.realpath(candidate)
+    return ""
+
+
+def detect_os_name():
+    """Detect the OS name matching CMake's CMAKE_SYSTEM_NAME."""
+    system = platform.system()
+    # CMake uses 'Darwin', 'Linux', 'Windows' which match platform.system()
+    return system
+
+
+def validate_tools(bin_dir, suite_cfg):
+    """Check that required tools exist in the bin directory."""
+    required = ["offloader", "api-query", "FileCheck", "split-file"]
+    if suite_cfg["clang"]:
+        required.extend(["clang-dxc", "clang"])
+
+    exe_suffix = ".exe" if platform.system() == "Windows" else ""
+    missing = []
+    for tool in required:
+        tool_path = os.path.join(bin_dir, tool + exe_suffix)
+        if not os.path.exists(tool_path):
+            missing.append(tool)
+    return missing
+
+
+def generate_site_config(
+    *,
+    suite_root,
+    bin_dir,
+    output_base,
+    suite,
+    suite_cfg,
+    dxc_path,
+    dxc_dir,
+    golden_dir,
+    os_name,
+    supports_spirv,
+    enable_debug,
+    enable_validation,
+):
+    """Generate the content of a lit.site.cfg.py file."""
+
+    def py_bool(val):
+        return "True" if val else "False"
+
+    def escape(p):
+        return p.replace("\\", "\\\\")
+
+    return textwrap.dedent(
+        f"""\
+        # Autogenerated by configure-test-suite.py
+        # Suite: {suite}
+        # Do not edit!
+
+        # Allow generated file to be relocatable.
+        import os
+        import platform
+        def path(p):
+            if not p: return ''
+            # Resolve relative to this file's directory for relocatability.
+            if platform.system() == 'Windows':
+                return os.path.abspath(os.path.join(os.path.dirname(__file__), p))
+            else:
+                return os.path.realpath(os.path.join(os.path.dirname(__file__), p))
+
+        import sys
+
+        config.offloadtest_obj_root = path(r"{escape(os.path.relpath(output_base, os.path.join(output_base, 'test', suite)))}")
+        config.offloadtest_src_root = path(r"{escape(os.path.relpath(suite_root, os.path.join(output_base, 'test', suite)))}")
+        config.llvm_tools_dir = lit_config.substitute(path(r"{escape(os.path.relpath(bin_dir, os.path.join(output_base, 'test', suite)))}"))
+        config.offloadtest_dxc = '"' + path(r"{escape(dxc_path)}") + '"'
+        config.offloadtest_supports_spirv = {py_bool(supports_spirv)}
+        config.offloadtest_test_clang = {py_bool(suite_cfg['clang'])}
+        config.offloadtest_test_warp = {py_bool(suite_cfg['warp'])}
+        if config.offloadtest_test_warp:
+            config.warp_arch = ""
+        config.offloadtest_dxc_dir = r"{escape(dxc_dir)}"
+        config.goldenimage_dir = r"{escape(golden_dir)}"
+
+        config.offloadtest_suite = "{suite}"
+        config.offloadtest_enable_d3d12 = {py_bool(suite_cfg['d3d12'])}
+        config.offloadtest_enable_vulkan = {py_bool(suite_cfg['vk'])}
+        config.offloadtest_enable_metal = {py_bool(suite_cfg['mtl'])}
+        config.offloadtest_os = "{os_name}"
+        config.offloadtest_enable_debug = {1 if enable_debug else 0}
+        config.offloadtest_enable_validation = {1 if enable_validation else 0}
+
+        import lit.llvm
+        lit.llvm.initialize(lit_config, config)
+
+        # Let the main config do the real work.
+        lit_config.load_config(
+            config, os.path.join(config.offloadtest_src_root, "test/lit.cfg.py"))
+        """
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Configure the HLSL offload test suite for standalone execution.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent(
+            """\
+            Available suites:
+              d3d12             DXC-compiled shaders on DirectX 12
+              vk                DXC-compiled shaders on Vulkan
+              mtl               DXC-compiled shaders on Metal
+              clang-d3d12       Clang-compiled shaders on DirectX 12
+              clang-vk          Clang-compiled shaders on Vulkan
+              clang-mtl         Clang-compiled shaders on Metal
+              warp-d3d12        DXC-compiled shaders on WARP (Windows only)
+              clang-warp-d3d12  Clang-compiled shaders on WARP (Windows only)
+
+            After configuring, run tests with:
+              lit <output-dir>/test/<suite> -v
+            """
+        ),
+    )
+
+    parser.add_argument(
+        "--suite",
+        type=str,
+        action="append",
+        dest="suites",
+        metavar="NAME",
+        help="Test suite to configure (may be specified multiple times)",
+    )
+    parser.add_argument(
+        "--list-suites",
+        action="store_true",
+        help="List all available test suites and exit",
+    )
+    parser.add_argument(
+        "--bin-dir",
+        type=str,
+        default=None,
+        help="Path to directory containing tool binaries "
+        "(default: auto-detect from install layout)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Base output directory for generated configs and test results "
+        "(default: <test-suite-root>/run)",
+    )
+    parser.add_argument(
+        "--dxc-path",
+        type=str,
+        default="",
+        help="Path to DXC executable (for non-clang suites)",
+    )
+    parser.add_argument(
+        "--dxc-dir",
+        type=str,
+        default="",
+        help="Directory containing DXC tools (dxc, dxv) for validation",
+    )
+    parser.add_argument(
+        "--golden-images",
+        type=str,
+        default=None,
+        help="Path to golden images directory "
+        "(default: auto-detect from install layout)",
+    )
+    parser.add_argument(
+        "--enable-debug",
+        action="store_true",
+        default=True,
+        help="Enable runtime debug layers (default: true)",
+    )
+    parser.add_argument(
+        "--no-debug",
+        action="store_false",
+        dest="enable_debug",
+        help="Disable runtime debug layers",
+    )
+    parser.add_argument(
+        "--enable-validation",
+        action="store_true",
+        default=False,
+        help="Enable runtime validation layers",
+    )
+    parser.add_argument(
+        "--os-name",
+        type=str,
+        default=None,
+        help="Override OS name (default: auto-detect; "
+        "values: Linux, Windows, Darwin)",
+    )
+
+    args = parser.parse_args()
+
+    if args.list_suites:
+        print("Available test suites:")
+        for name in sorted(SUITES.keys()):
+            cfg = SUITES[name]
+            print(f"  {name:20s}  {cfg['desc']}")
+        return 0
+
+    if not args.suites:
+        parser.error("--suite is required (use --list-suites to see options)")
+
+    # Validate suite names.
+    for suite in args.suites:
+        if suite not in SUITES:
+            parser.error(
+                f"Unknown suite '{suite}'. "
+                f"Available: {', '.join(sorted(SUITES.keys()))}"
+            )
+
+    script_dir = get_script_dir()
+
+    # Determine bin directory.
+    bin_dir = args.bin_dir
+    if bin_dir is None:
+        bin_dir = find_bin_dir(script_dir)
+        if bin_dir is None:
+            parser.error(
+                "Could not auto-detect bin directory. "
+                "Use --bin-dir to specify the path to installed tool binaries."
+            )
+    bin_dir = os.path.realpath(bin_dir)
+
+    # Determine output directory.
+    output_base = args.output_dir
+    if output_base is None:
+        output_base = os.path.join(script_dir, "run")
+    output_base = os.path.realpath(output_base)
+
+    # Determine golden images directory.
+    golden_dir = args.golden_images
+    if golden_dir is None:
+        golden_dir = find_golden_images(script_dir)
+    elif golden_dir:
+        golden_dir = os.path.realpath(golden_dir)
+
+    # Determine OS name.
+    os_name = args.os_name if args.os_name else detect_os_name()
+
+    # DXC configuration.
+    dxc_path = args.dxc_path
+    dxc_dir = args.dxc_dir
+
+    # Auto-detect DXC for non-clang suites if not specified.
+    needs_dxc = any(not SUITES[s]["clang"] for s in args.suites)
+    if needs_dxc and not dxc_path:
+        dxc_found = shutil.which("dxc")
+        if dxc_found:
+            dxc_path = os.path.realpath(dxc_found)
+            if not dxc_dir:
+                dxc_dir = os.path.dirname(dxc_path)
+
+    # Generate configs for each suite.
+    for suite in args.suites:
+        suite_cfg = SUITES[suite]
+
+        # Validate tools.
+        missing = validate_tools(bin_dir, suite_cfg)
+        if missing:
+            print(
+                f"Warning: [{suite}] Missing tools in {bin_dir}: "
+                f"{', '.join(missing)}",
+                file=sys.stderr,
+            )
+
+        # Check DXC requirement.
+        if not suite_cfg["clang"] and not dxc_path:
+            print(
+                f"Warning: [{suite}] DXC not found. Use --dxc-path for "
+                f"non-clang suites.",
+                file=sys.stderr,
+            )
+
+        # SPIR-V support: assume true for Vulkan suites.
+        supports_spirv = suite_cfg["vk"]
+
+        # Create output directory.
+        suite_dir = os.path.join(output_base, "test", suite)
+        os.makedirs(suite_dir, exist_ok=True)
+
+        # Generate site config.
+        site_cfg_content = generate_site_config(
+            suite_root=script_dir,
+            bin_dir=bin_dir,
+            output_base=output_base,
+            suite=suite,
+            suite_cfg=suite_cfg,
+            dxc_path=dxc_path,
+            dxc_dir=dxc_dir,
+            golden_dir=golden_dir,
+            os_name=os_name,
+            supports_spirv=supports_spirv,
+            enable_debug=args.enable_debug,
+            enable_validation=args.enable_validation,
+        )
+
+        site_cfg_path = os.path.join(suite_dir, "lit.site.cfg.py")
+        with open(site_cfg_path, "w") as f:
+            f.write(site_cfg_content)
+
+        print(f"Configured: {suite}")
+        print(f"  Config: {site_cfg_path}")
+
+    print()
+    if len(args.suites) == 1:
+        suite = args.suites[0]
+        suite_dir = os.path.join(output_base, "test", suite)
+        print("To run the test suite:")
+        print(f"  lit {suite_dir}")
+        print()
+        print("Or with verbose output:")
+        print(f"  lit {suite_dir} -v")
+    else:
+        print("To run all configured suites:")
+        print(f"  lit {output_base}/test")
+        print()
+        print("To run a specific suite:")
+        for suite in args.suites:
+            print(f"  lit {os.path.join(output_base, 'test', suite)}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
